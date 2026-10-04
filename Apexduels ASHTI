@@ -1,0 +1,701 @@
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
+struct Vec2 {
+    float x, y;
+    Vec2() : x(0), y(0) {}
+    Vec2(float x_, float y_) : x(x_), y(y_) {}
+    Vec2 operator+(const Vec2& o) const { return Vec2(x + o.x, y + o.y); }
+    Vec2 operator-(const Vec2& o) const { return Vec2(x - o.x, y - o.y); }
+    Vec2 operator*(float k) const { return Vec2(x * k, y * k); }
+    float Len() const { return std::sqrt(x * x + y * y); }
+};
+static float Dist(const Vec2& a, const Vec2& b) { return (a - b).Len(); }
+static Vec2 Norm(const Vec2& v) { float l = v.Len(); return l > 1e-6f ? v * (1.0f / l) : Vec2(); }
+static float Clampf(float v, float lo, float hi) { return std::min(hi, std::max(lo, v)); }
+static std::string Fmt(const char* f, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, f);
+    std::vsnprintf(buf, sizeof buf, f, ap);
+    va_end(ap);
+    return buf;
+}
+static bool g_quiet = false;  
+namespace Rules {
+    const float tick          = 0.25f;   
+    const float arena         = 30.0f;
+    const float walkSpeed     = 5.0f;    
+    const float sprintSpeed   = 10.0f;
+    const float staminaMax    = 100.0f;
+    const float sprintCost    = 25.0f;   
+    const float staminaRegen  = 10.0f;   
+    const float attackRange   = 3.0f;
+    const float attackCd      = 1.0f;
+    const float attackCost    = 8.0f;
+    const int   playerDamage  = 10;
+    const int   maxHealth     = 100;
+    const int   startPotions  = 2;
+    const int   potionHeal    = 30;
+    const int   nextRoundHeal = 40;
+    const float enemyRange    = 2.5f;
+    const float enemyCd       = 1.25f;
+    const float speedTol      = 1.10f;   
+    const float rangeTol      = 1.15f;
+    const float teleportDist  = 8.0f;    
+    const int   strikeWarn    = 4;       
+    const int   strikeKick    = 8;       
+    const int   cleanToDecay  = 8;       
+    const int   heartbeatEvery = 4;
+    const int   firstChallenge = 6;      
+    const int   challengeEvery = 10;
+    const int   challengeWindow = 2;     
+}
+static uint32_t ChallengeResponse(uint32_t n) {
+    uint32_t x = (n * 2654435761u) ^ 0xC0FFEE11u;
+    return (x << 13) | (x >> 19);
+}
+class Obfuscated {
+public:
+    Obfuscated() : key_(0xA5A5A5A5u), enc_(0), chk_(0) { Set(0); }
+    void Set(int v) {
+        key_ = key_ * 1664525u + 1013904223u;
+        enc_ = static_cast<uint32_t>(v) ^ key_;
+        chk_ = Check(v, key_);
+    }
+    int  Get() const { return static_cast<int>(enc_ ^ key_); }
+    bool Tampered() const { return chk_ != Check(Get(), key_); }
+    void ForceWrite(int v) { enc_ = static_cast<uint32_t>(v) ^ key_; }
+private:
+    static uint32_t Check(int v, uint32_t k) {
+        return (static_cast<uint32_t>(v) * 2654435761u) ^ ((k << 7) | (k >> 25)) ^ 0x9E3779B9u;
+    }
+    uint32_t key_, enc_, chk_;
+};
+enum PacketType { PKT_MOVE, PKT_ATTACK, PKT_HEAL, PKT_HEARTBEAT, PKT_CHALLENGE };
+struct Packet {
+    PacketType type;
+    uint32_t   seq;
+    Vec2       pos;            
+    bool       sprint;         
+    bool       claimedHit;     
+    int        claimedDamage;  
+    int        claimedHeal;    
+    int        reportedHealth; 
+    bool       tamperFlag;     
+    uint32_t   response;       
+    Packet() : type(PKT_MOVE), seq(0), sprint(false), claimedHit(false), claimedDamage(0),
+               claimedHeal(0), reportedHealth(0), tamperFlag(false), response(0) {}
+};
+struct Snapshot {
+    Vec2 pos, enemyPos;
+    int health, enemyHealth, enemyMax, potions, round;
+    float stamina, atkCd;
+    bool corrected;
+    uint32_t challenge;
+    Snapshot() : health(0), enemyHealth(0), enemyMax(0), potions(0), round(1),
+                 stamina(0), atkCd(0), corrected(false), challenge(0) {}
+};
+class Server {
+public:
+    bool ac;  
+    Vec2 pos, enemyPos;
+    float stamina, atkCd, enemyCd;
+    int health, enemyHealth, potions, round;
+    uint32_t lastSeq;
+    int strikes, clean, tickNo, swings, landed;
+    bool kicked, flagged;
+    std::map<std::string, int> counts;
+    Server() : ac(true) { Reset(); }
+    void Reset() {
+        round = 1;
+        pos = Vec2(5, 15);       enemyPos = Vec2(25, 15);
+        stamina = Rules::staminaMax;
+        health = Rules::maxHealth; enemyHealth = EnemyMax();
+        potions = Rules::startPotions;
+        atkCd = 0; enemyCd = 0;
+        lastSeq = 0; strikes = 0; clean = 0; tickNo = 0; swings = 0; landed = 0;
+        kicked = false; flagged = false; counts.clear();
+        moves_ = attacks_ = heals_ = 0; sprinted_ = violated_ = corrected_ = false;
+        swingTicks_.clear(); botFlagged_ = false;
+        rng_ = 12345u; pendingNonce_ = 0; deadline_ = 0; challengeOut_ = 0;
+        nextChallenge_ = Rules::firstChallenge;
+    }
+    int   EnemyMax() const { return Rules::maxHealth + 25 * (round - 1); }
+    int   EnemyDmg() const { return 6 + 2 * (round - 1); }
+    float EnemySpd() const { return 3.0f + 0.3f * static_cast<float>(round - 1); }
+    bool Over() const { return kicked || health <= 0 || enemyHealth <= 0; }
+    bool RoundWon() const { return enemyHealth <= 0 && health > 0 && !kicked; }
+    bool NextRound() {
+        if (!RoundWon()) return false;
+        ++round;
+        enemyHealth = EnemyMax(); enemyPos = Vec2(25, 15); pos = Vec2(5, 15);
+        health = std::min(Rules::maxHealth, health + Rules::nextRoundHeal);
+        stamina = Rules::staminaMax; ++potions;
+        atkCd = 0; enemyCd = 0; swings = 0; landed = 0; swingTicks_.clear();
+        return true;
+    }
+    void BeginTick() {
+        ++tickNo; moves_ = attacks_ = heals_ = 0;
+        sprinted_ = violated_ = corrected_ = false; challengeOut_ = 0;
+    }
+    void Handle(const Packet& p) {
+        if (Over()) return;
+        if (ac && p.seq <= lastSeq) {
+            Violation("Sequence", Fmt("seq %u <= last %u (replayed/reordered)", p.seq, lastSeq), 1);
+            return;
+        }
+        if (p.seq > lastSeq) lastSeq = p.seq;
+        switch (p.type) {
+            case PKT_MOVE:      OnMove(p);      break;
+            case PKT_ATTACK:    OnAttack(p);    break;
+            case PKT_HEAL:      OnHeal(p);      break;
+            case PKT_HEARTBEAT: OnHeartbeat(p); break;
+            case PKT_CHALLENGE: OnChallenge(p); break;
+        }
+    }
+    void EndTick() {
+        if (!sprinted_) stamina = std::min(Rules::staminaMax, stamina + Rules::staminaRegen * Rules::tick);
+        if (ac) RunChallenges();
+        if (!Over()) {  
+            const float d = Dist(pos, enemyPos);
+            if (d > Rules::enemyRange) {
+                const float step = std::min(EnemySpd() * Rules::tick, d - Rules::enemyRange * 0.9f);
+                enemyPos = enemyPos + Norm(pos - enemyPos) * step;
+            } else if (enemyCd <= 0.001f) {
+                health -= EnemyDmg();
+                enemyCd = Rules::enemyCd;
+                if (!g_quiet) std::printf("  [ENEMY] bites you for %d\n", EnemyDmg());
+            }
+        }
+        atkCd   = std::max(0.0f, atkCd - Rules::tick);
+        enemyCd = std::max(0.0f, enemyCd - Rules::tick);
+        if (!violated_) {  
+            if (++clean >= Rules::cleanToDecay && strikes > 0) { --strikes; clean = 0; }
+        }
+    }
+    Snapshot Snap() const {
+        Snapshot s;
+        s.pos = pos; s.enemyPos = enemyPos; s.health = health; s.enemyHealth = enemyHealth;
+        s.enemyMax = EnemyMax(); s.potions = potions; s.round = round;
+        s.stamina = stamina; s.atkCd = atkCd; s.corrected = corrected_; s.challenge = challengeOut_;
+        return s;
+    }
+    bool BotFlagged() const { return botFlagged_; }
+private:
+    int moves_, attacks_, heals_;
+    bool sprinted_, violated_, corrected_, botFlagged_;
+    std::vector<int> swingTicks_;
+    uint32_t rng_, pendingNonce_, challengeOut_;
+    int deadline_, nextChallenge_;
+    uint32_t NextRand() { rng_ = rng_ * 1664525u + 1013904223u; return rng_ ? rng_ : 1u; }
+    void Violation(const std::string& rule, const std::string& detail, int weight) {
+        ++counts[rule]; strikes += weight; clean = 0; violated_ = true; corrected_ = true;
+        std::printf("  [AC] VIOLATION %-14s %s\n       -> +%d, strike points %d/%d\n",
+                    rule.c_str(), detail.c_str(), weight, strikes, Rules::strikeKick);
+        if (strikes >= Rules::strikeWarn && !flagged) {
+            flagged = true;
+            std::puts("  [AC] TELEMETRY: player flagged for review");
+        }
+        if (strikes >= Rules::strikeKick && !kicked) {
+            kicked = true;
+            std::puts("  [AC] strike limit reached: player disconnected");
+        }
+    }
+    void RunChallenges() {
+        if (pendingNonce_ != 0 && tickNo > deadline_) {
+            pendingNonce_ = 0; nextChallenge_ = tickNo + Rules::challengeEvery;
+            Violation("ChallengeFail", "no valid response within the challenge window", 2);
+        } else if (pendingNonce_ == 0 && tickNo >= nextChallenge_) {
+            pendingNonce_ = challengeOut_ = NextRand();
+            deadline_ = tickNo + Rules::challengeWindow;
+        }
+    }
+    void OnChallenge(const Packet& p) {
+        if (!ac || pendingNonce_ == 0) return;
+        const bool ok = (p.response == ChallengeResponse(pendingNonce_));
+        pendingNonce_ = 0; nextChallenge_ = tickNo + Rules::challengeEvery;
+        if (!ok) Violation("ChallengeFail", "wrong challenge response", 2);
+    }
+    void OnMove(const Packet& p) {
+        if (!ac) { pos = p.pos; return; }  
+        if (++moves_ > 1) { Violation("RateLimit", "more than 1 move packet in a tick", 1); return; }
+        if (!std::isfinite(p.pos.x) || !std::isfinite(p.pos.y)) {
+            Violation("InvalidData", "non-finite coordinates in move packet", 3);
+            return;
+        }
+        if (p.pos.x < 0 || p.pos.y < 0 || p.pos.x > Rules::arena || p.pos.y > Rules::arena) {
+            Violation("OutOfBounds", Fmt("(%.1f, %.1f) is outside the arena", p.pos.x, p.pos.y), 2);
+            return;
+        }
+        const float d = Dist(pos, p.pos);
+        if (d > Rules::teleportDist) {
+            Violation("Teleport", Fmt("moved %.1fm in one tick (hard cap %.1fm)", d, Rules::teleportDist), 2);
+            return;
+        }
+        const float speed = d / Rules::tick;
+        const bool running = p.sprint && stamina > 0.0f;
+        const float limit = running ? Rules::sprintSpeed : Rules::walkSpeed;
+        if (speed > limit * Rules::speedTol || (p.sprint && stamina <= 0.0f && speed > Rules::walkSpeed)) {
+            Violation("Speed", Fmt("asserted %.1f m/s, allowed %.1f m/s (server stamina %.0f)", speed, limit, stamina), 1);
+            return;
+        }
+        if (running && d > 0.0f) {
+            stamina = std::max(0.0f, stamina - Rules::sprintCost * Rules::tick);
+            sprinted_ = true;
+        }
+        pos = p.pos;
+    }
+    void OnAttack(const Packet& p) {
+        const float d = Dist(pos, enemyPos);
+        if (!ac) {  
+            ++swings;
+            if (p.claimedHit) {
+                const int dmg = p.claimedDamage > 0 ? p.claimedDamage : Rules::playerDamage;
+                enemyHealth -= dmg; ++landed;
+                std::printf("  [SWING] HIT for %d%s\n", dmg,
+                            p.claimedDamage > 0 ? "  (no validation: client-claimed damage applied)" : "");
+            } else {
+                std::puts("  [SWING] MISS (client said it missed)");
+            }
+            return;
+        }
+        if (++attacks_ > 1) { Violation("RateLimit", "more than 1 attack packet in a tick", 1); return; }
+        if (p.claimedDamage != 0) {
+            Violation("ForgedPayload", Fmt("client sent damage=%d; damage is server-owned", p.claimedDamage), 2);
+            return;
+        }
+        if (atkCd > 0.001f) { Violation("Cooldown", Fmt("%.2fs of cooldown remaining", atkCd), 1); return; }
+        if (stamina < Rules::attackCost) {
+            Violation("Stamina", Fmt("needs %.0f, server stamina is %.0f", Rules::attackCost, stamina), 1);
+            return;
+        }
+        const bool inReach = d <= Rules::attackRange * Rules::rangeTol;
+        if (p.claimedHit && !inReach) {
+            Violation("OutOfRange", Fmt("claimed hit at %.1fm, reach is %.1fm", d, Rules::attackRange), 1);
+            return;
+        }
+        stamina -= Rules::attackCost;
+        atkCd = Rules::attackCd;
+        ++swings;
+        swingTicks_.push_back(tickNo);
+        if (inReach) {  
+            enemyHealth -= Rules::playerDamage; ++landed;
+            if (!g_quiet) std::printf("  [SWING] HIT for %d (distance %.1fm)\n", Rules::playerDamage, d);
+        } else if (!g_quiet) {
+            std::printf("  [SWING] MISS - enemy is %.1fm away, reach is %.1fm\n", d, Rules::attackRange);
+        }
+        CheckBotPattern();
+    }
+    void CheckBotPattern() {
+        if (botFlagged_ || swings < 9) return;
+        const size_t n = swingTicks_.size();
+        double sum = 0, sq = 0;
+        for (size_t i = n - 8; i < n; ++i) {
+            const double iv = swingTicks_[i] - swingTicks_[i - 1];
+            sum += iv; sq += iv * iv;
+        }
+        const double mean = sum / 8.0;
+        const double sd = std::sqrt(std::max(0.0, sq / 8.0 - mean * mean));
+        const double acc = static_cast<double>(landed) / static_cast<double>(swings);
+        if (acc >= 0.97 && mean <= 4.5 && sd <= 0.3) {
+            botFlagged_ = true;
+            Violation("BotPattern", Fmt("%d swings, %.0f%% accuracy, interval %.2f +/- %.2f ticks (inhuman consistency)",
+                                        swings, acc * 100.0, mean, sd), 4);
+        }
+    }
+    void OnHeal(const Packet& p) {
+        if (!ac) {  
+            const int amt = p.claimedHeal > 0 ? p.claimedHeal : Rules::potionHeal;
+            health += amt;
+            std::printf("  [HEAL] +%d HP%s\n", amt, p.claimedHeal > 0 ? "  (no validation: client-claimed amount applied)" : "");
+            return;
+        }
+        if (++heals_ > 1) { Violation("RateLimit", "more than 1 heal packet in a tick", 1); return; }
+        if (p.claimedHeal != 0) {
+            Violation("ForgedPayload", Fmt("client sent heal=%d; healing is server-owned", p.claimedHeal), 2);
+            return;
+        }
+        if (potions <= 0) { Violation("NoPotions", "heal requested with 0 potions on the server", 1); return; }
+        --potions;
+        const int before = health;
+        health = std::min(Rules::maxHealth, health + Rules::potionHeal);
+        std::printf("  [HEAL] +%d HP (%d potions left)\n", health - before, potions);
+    }
+    void OnHeartbeat(const Packet& p) {
+        if (!ac) { health = p.reportedHealth; return; }  
+        if (p.tamperFlag) {
+            Violation("ClientTamper", "client integrity module reports modified memory", 2);
+        } else if (p.reportedHealth != health) {
+            Violation("StateMismatch", Fmt("client reports HP %d, server HP is %d", p.reportedHealth, health), 2);
+        }
+    }
+};
+class Client {
+public:
+    Vec2 pos, enemyPos;
+    int enemyHealth, enemyMax, potions, round;
+    float atkCd;
+    uint32_t seq, pendingResp;
+    bool integrity;       
+    bool respond;         
+    bool hasResp;
+    Obfuscated hp, st;    
+    Packet last;
+    Client() : enemyHealth(0), enemyMax(0), potions(0), round(1), atkCd(0), seq(0),
+               pendingResp(0), integrity(true), respond(true), hasResp(false) {}
+    void Apply(const Snapshot& s) {
+        pos = s.pos; enemyPos = s.enemyPos; enemyHealth = s.enemyHealth; enemyMax = s.enemyMax;
+        potions = s.potions; round = s.round; atkCd = s.atkCd;
+        hp.Set(s.health);
+        st.Set(static_cast<int>(s.stamina + 0.5f));
+        if (s.challenge != 0 && respond) { pendingResp = ChallengeResponse(s.challenge); hasResp = true; }
+    }
+    int  Health()  const { return hp.Get(); }
+    int  Stamina() const { return st.Get(); }
+    bool Tampered() const { return integrity && (hp.Tampered() || st.Tampered()); }
+    Packet Stamp(Packet p) { p.seq = ++seq; last = p; return p; }
+    Packet MovePacket(Vec2 dir, bool sprint) {  
+        Packet p; p.type = PKT_MOVE;
+        const bool run = sprint && Stamina() > 0;
+        const float step = (run ? Rules::sprintSpeed : Rules::walkSpeed) * Rules::tick;
+        Vec2 np = pos + Norm(dir) * step;
+        np.x = Clampf(np.x, 0, Rules::arena);
+        np.y = Clampf(np.y, 0, Rules::arena);
+        p.pos = np; p.sprint = run;
+        return Stamp(p);
+    }
+    Packet AttackPacket() {                     
+        Packet p; p.type = PKT_ATTACK;
+        p.claimedHit = Dist(pos, enemyPos) <= Rules::attackRange;
+        return Stamp(p);
+    }
+    Packet HealPacket() {
+        Packet p; p.type = PKT_HEAL;
+        return Stamp(p);
+    }
+};
+class Game {
+public:
+    Game() : hb_(0), freezeHp_(-1), freezeSt_(-1), rng_(2024u) { Reset(); }
+    void Help() const {
+        std::puts(
+            "\nApexDuel v2 - defeat the enemy (arena 30x30; you start at x=5, enemy at x=25)\n"
+            "  w a s d            walk            W A S D   sprint (costs stamina)\n"
+            "  chase / rush       walk / sprint toward the enemy\n"
+            "  space | attack | f attack (reach 3m, 1s cooldown, 8 stamina). The spacebar + Enter works too.\n"
+            "  heal               drink a potion (+30 HP, you start with 2)\n"
+            "  next               start the next, tougher round after a win\n"
+            "  wait               pass a tick\n"
+            "  anticheat on|off   toggle protection (default on; resets the match)\n"
+            "  cheat <name>       speedhack | teleport | noclip | nan | damage | reach | spam |\n"
+            "                     replay | dupeheal | freeheal | memedit health|stamina [value] |\n"
+            "                     ignorechallenge | autofight\n"
+            "  status | reset | demo | help | quit\n"
+            "Every action is one 0.25s server tick. You must be within 3m of the enemy to hit it.\n");
+    }
+    bool Run(const std::string& line) {
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
+            if (!line.empty() && line.find(' ') != std::string::npos) DoAttack();  
+            return true;
+        }
+        std::vector<std::string> a = Split(line);
+        const std::string& c = a[0];
+        if (c == "quit" || c == "exit") return false;
+        else if (c == "help")    Help();
+        else if (c == "status")  Status();
+        else if (c == "reset")   { Reset(); std::puts("  match reset"); }
+        else if (c == "demo")    Demo();
+        else if (c == "anticheat") {
+            if (a.size() < 2 || (a[1] != "on" && a[1] != "off")) std::puts("  usage: anticheat on|off");
+            else { SetAC(a[1] == "on"); std::printf("  anti-cheat %s (match reset)\n", srv_.ac ? "ON" : "OFF (naive trusting server)"); }
+        }
+        else if (c == "cheat")   Cheat(a);
+        else if (c == "wait")    { if (!Guard()) Tick(std::vector<Packet>()); }
+        else if (c == "space" || c == "attack" || c == "f") DoAttack();
+        else if (c == "heal")    DoHeal();
+        else if (c == "next")    DoNext();
+        else if (c == "chase" || c == "rush")   DoMove(Norm(cli_.enemyPos - cli_.pos), c == "rush");
+        else if (c.size() == 1 && std::strchr("wasdWASD", c[0])) {
+            const char k = static_cast<char>(std::tolower(static_cast<unsigned char>(c[0])));
+            Vec2 dir = k == 'w' ? Vec2(0, 1) : k == 's' ? Vec2(0, -1) : k == 'a' ? Vec2(-1, 0) : Vec2(1, 0);
+            DoMove(dir, std::isupper(static_cast<unsigned char>(c[0])) != 0);
+        }
+        else if (IsCheatName(c)) {                 
+            std::vector<std::string> b(1, "cheat");
+            b.insert(b.end(), a.begin(), a.end());
+            Cheat(b);
+        }
+        else std::puts("  unknown command (try 'help')");
+        return true;
+    }
+    void Demo() {
+        const bool oldQuiet = g_quiet;
+        std::puts("\n################ PART 1: NAIVE SERVER (anti-cheat OFF) ################");
+        Section("Speedhack + teleport + forged damage = instant win",
+                false, {"cheat speedhack", "cheat teleport", "cheat damage"});
+        Section("Memory edit: HUD health frozen at 999, synced to a trusting server",
+                false, {"cheat memedit health 999", "wait", "wait", "wait", "wait", "status"});
+        Section("Potion duplication: client claims a 500 HP heal",
+                false, {"cheat dupeheal", "status"});
+        Section("NaN injection: corrupt position, enemy keeps biting",
+                false, {"cheat nan", "wait", "status"});
+        Section("Perfect-timing bot: wins with nobody noticing",
+                false, {"cheat autofight", "status"});
+        std::puts("\n################ PART 2: PROTECTED SERVER (anti-cheat ON) ################");
+        Section("Speedhack",            true, {"cheat speedhack"});
+        Section("Teleport",             true, {"cheat teleport"});
+        Section("Noclip (outside the arena)", true, {"cheat noclip"});
+        Section("NaN injection",        true, {"cheat nan"});
+        Section("Forged damage packet", true, {"cheat damage"});
+        Section("Out-of-reach hit",     true, {"cheat reach"});
+        Section("Attack spam (5 packets in one tick)", true, {"cheat spam"});
+        Section("Replayed packet",      true, {"d", "cheat replay"});
+        Section("Forged heal amount",   true, {"cheat dupeheal"});
+        Section("Potion dupe: heal with no potions left", true, {"cheat freeheal", "cheat freeheal", "cheat freeheal"});
+        Section("Memory edit: server HP untouched, tamper detected",
+                true, {"cheat memedit health 999", "wait", "wait", "wait", "wait", "status"});
+        Section("Modified client that ignores anti-cheat challenges",
+                true, {"cheat ignorechallenge", "wait", "wait", "wait", "wait", "wait", "wait", "wait", "wait", "wait"});
+        Section("Perfect-timing bot (every packet is individually legal)",
+                true, {"cheat autofight", "status"});
+        std::puts("\n################ PART 3: HUMAN-LIKE HONEST PLAYER, AC ON (must NOT be flagged) ################");
+        SetAC(true); Reset();
+        rng_ = 7u;
+        AutoPlay(true, 400);
+        g_quiet = oldQuiet;
+        Status();
+        std::printf("  result: %s\n", srv_.RoundWon() ? "enemy defeated with no violations" : "match ended otherwise");
+    }
+private:
+    Server srv_;
+    Client cli_;
+    int hb_, freezeHp_, freezeSt_;
+    uint32_t rng_;
+    int Rand(int n) { rng_ = rng_ * 1664525u + 1013904223u; return static_cast<int>((rng_ >> 16) % static_cast<uint32_t>(n)); }
+    static bool IsCheatName(const std::string& c) {
+        static const char* names[] = {"speedhack", "teleport", "noclip", "nan", "damage", "reach", "spam",
+                                      "replay", "dupeheal", "freeheal", "memedit", "ignorechallenge", "autofight"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+            if (c == names[i]) return true;
+        return false;
+    }
+    static std::vector<std::string> Split(const std::string& s) {
+        std::istringstream is(s); std::vector<std::string> out; std::string t;
+        while (is >> t) out.push_back(t);
+        return out;
+    }
+    void SetAC(bool on) { srv_.ac = on; Reset(); }
+    void Reset() {
+        srv_.Reset();
+        cli_ = Client();
+        cli_.integrity = srv_.ac;
+        cli_.Apply(srv_.Snap());
+        hb_ = 0; freezeHp_ = freezeSt_ = -1;
+    }
+    void Section(const char* title, bool ac, const std::vector<std::string>& cmds) {
+        SetAC(ac);
+        std::printf("\n--- %s ---\n", title);
+        for (size_t i = 0; i < cmds.size(); ++i) {
+            std::printf("> %s\n", cmds[i].c_str());
+            Run(cmds[i]);
+        }
+    }
+    bool Guard() const {
+        if (srv_.Over()) { std::puts("  match is over - type 'reset' (or 'next' after a win)"); return true; }
+        return false;
+    }
+    void DoMove(Vec2 dir, bool sprint) {
+        if (Guard()) return;
+        std::vector<Packet> pk;
+        pk.push_back(cli_.MovePacket(dir, sprint));
+        Tick(pk);
+    }
+    void DoAttack() {
+        if (Guard()) return;
+        if (cli_.atkCd > 0.001f) { std::printf("  (client) attack on cooldown (%.2fs)\n", cli_.atkCd); return; }
+        if (cli_.Stamina() < Rules::attackCost) { std::puts("  (client) not enough stamina"); return; }
+        const float d = Dist(cli_.pos, cli_.enemyPos);
+        if (d > Rules::attackRange * Rules::rangeTol) {   
+            std::printf("  (client) enemy is %.1fm away, your reach is %.1fm - use 'chase' or 'rush' first\n",
+                        d, Rules::attackRange);
+            return;
+        }
+        std::vector<Packet> pk;
+        pk.push_back(cli_.AttackPacket());
+        Tick(pk);
+    }
+    void DoHeal() {
+        if (Guard()) return;
+        if (cli_.potions <= 0) { std::puts("  (client) no potions left"); return; }
+        if (cli_.Health() >= Rules::maxHealth) { std::puts("  (client) already at full health"); return; }
+        std::vector<Packet> pk;
+        pk.push_back(cli_.HealPacket());
+        Tick(pk);
+    }
+    void DoNext() {
+        if (!srv_.NextRound()) { std::puts("  you can only start the next round after winning one"); return; }
+        cli_.Apply(srv_.Snap());
+        std::printf("  === ROUND %d === enemy HP %d, bites for %d, moves faster. +%d HP, +1 potion.\n",
+                    srv_.round, srv_.EnemyMax(), srv_.EnemyDmg(), Rules::nextRoundHeal);
+    }
+    void AutoPlay(bool human, int maxTicks) {
+        const bool oldQuiet = g_quiet;
+        g_quiet = true;
+        for (int i = 0; i < maxTicks && !srv_.Over(); ++i) {
+            const float d = Dist(cli_.pos, cli_.enemyPos);
+            if (human && Rand(100) < 25)            { Run("wait"); continue; }
+            if (d > 6.0f)                           Run("rush");
+            else if (d > 2.9f) {
+                if (human && d < 5.0f && Rand(100) < 20) Run("space");  
+                else Run("chase");
+            }
+            else if (cli_.atkCd <= 0.001f)          Run("space");
+            else                                    Run("wait");
+        }
+        g_quiet = oldQuiet;
+        if (srv_.RoundWon()) std::puts("  *** ENEMY DEFEATED ***");
+        else if (srv_.kicked) std::puts("  *** DISCONNECTED BY ANTI-CHEAT ***");
+        else if (srv_.health <= 0) std::puts("  *** YOU DIED ***");
+    }
+    void Cheat(const std::vector<std::string>& a) {
+        if (Guard()) return;
+        if (a.size() < 2) { std::puts("  usage: cheat <name>   (see 'help')"); return; }
+        const std::string& c = a[1];
+        std::vector<Packet> pk;
+        const Vec2 toward = Norm(cli_.enemyPos - cli_.pos);
+        if (c == "speedhack") {            
+            Packet p; p.type = PKT_MOVE; p.sprint = true;
+            p.pos = cli_.pos + toward * 4.0f;
+            pk.push_back(cli_.Stamp(p));
+        } else if (c == "teleport") {      
+            Packet p; p.type = PKT_MOVE;
+            p.pos = Vec2(cli_.enemyPos.x - 1.0f, cli_.enemyPos.y);
+            pk.push_back(cli_.Stamp(p));
+        } else if (c == "noclip") {        
+            Packet p; p.type = PKT_MOVE;
+            p.pos = Vec2(-3.0f, cli_.pos.y);
+            pk.push_back(cli_.Stamp(p));
+        } else if (c == "nan") {           
+            Packet p; p.type = PKT_MOVE;
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            p.pos = Vec2(nan, nan);
+            pk.push_back(cli_.Stamp(p));
+        } else if (c == "damage") {        
+            Packet p = cli_.AttackPacket();
+            p.claimedHit = true; p.claimedDamage = 9999;
+            cli_.last = p; pk.push_back(p);
+        } else if (c == "reach") {         
+            Packet p = cli_.AttackPacket();
+            p.claimedHit = true;
+            cli_.last = p; pk.push_back(p);
+        } else if (c == "spam") {          
+            for (int i = 0; i < 5; ++i) pk.push_back(cli_.AttackPacket());
+        } else if (c == "replay") {        
+            if (cli_.seq == 0) { std::puts("  nothing to replay yet - make a move first"); return; }
+            pk.push_back(cli_.last);
+        } else if (c == "dupeheal") {      
+            Packet p; p.type = PKT_HEAL; p.claimedHeal = 500;
+            pk.push_back(cli_.Stamp(p));
+        } else if (c == "freeheal") {      
+            pk.push_back(cli_.HealPacket());
+        } else if (c == "memedit") {       
+            const std::string what = a.size() > 2 ? a[2] : "health";
+            const int v = a.size() > 3 ? std::atoi(a[3].c_str()) : 999;
+            if (what == "health")       freezeHp_ = v;
+            else if (what == "stamina") freezeSt_ = v;
+            else { std::puts("  memedit health|stamina [value]"); return; }
+            ApplyFreezes();
+            std::printf("  [CHEAT] %s slot frozen at %d in client memory\n", what.c_str(), v);
+        } else if (c == "ignorechallenge") {  
+            cli_.respond = false; cli_.hasResp = false;
+            std::puts("  [CHEAT] this client no longer answers anti-cheat challenges");
+            return;
+        } else if (c == "autofight") {     
+            std::puts("  [CHEAT] bot is playing the match...");
+            AutoPlay(false, 400);
+            return;
+        } else { std::puts("  unknown cheat (see 'help')"); return; }
+        Tick(pk);
+    }
+    void ApplyFreezes() {
+        if (freezeHp_ >= 0) cli_.hp.ForceWrite(freezeHp_);
+        if (freezeSt_ >= 0) cli_.st.ForceWrite(freezeSt_);
+    }
+    void Tick(std::vector<Packet> pk) {
+        if (cli_.hasResp) {                      
+            Packet r; r.type = PKT_CHALLENGE; r.response = cli_.pendingResp;
+            pk.push_back(cli_.Stamp(r));
+            cli_.hasResp = false;
+        }
+        if (++hb_ >= Rules::heartbeatEvery) {    
+            hb_ = 0;
+            Packet h; h.type = PKT_HEARTBEAT;
+            h.reportedHealth = cli_.Health();
+            h.tamperFlag = cli_.Tampered();
+            pk.push_back(cli_.Stamp(h));
+        }
+        srv_.BeginTick();
+        for (size_t i = 0; i < pk.size(); ++i) srv_.Handle(pk[i]);
+        srv_.EndTick();
+        const Snapshot s = srv_.Snap();
+        cli_.Apply(s);          
+        ApplyFreezes();         
+        if (!g_quiet) {
+            const float d = Dist(s.pos, s.enemyPos);
+            std::printf("  [t=%03d] R%d HP %d | ST %d | PT %d | you (%.1f,%.1f) | enemy HP %d/%d (%.1f,%.1f) dist %.1f%s%s\n",
+                        srv_.tickNo, s.round, cli_.Health(), cli_.Stamina(), s.potions, s.pos.x, s.pos.y,
+                        s.enemyHealth, s.enemyMax, s.enemyPos.x, s.enemyPos.y, d,
+                        d <= Rules::attackRange ? "  [IN REACH]" : "",
+                        s.corrected ? "  [server corrected you]" : "");
+        }
+        if (!g_quiet) {
+            if (srv_.RoundWon())            std::puts("  *** ENEMY DEFEATED - type 'next' for a tougher round ***");
+            else if (srv_.health <= 0)      std::puts("  *** YOU DIED ***");
+            else if (srv_.kicked)           std::puts("  *** DISCONNECTED BY ANTI-CHEAT ***");
+        }
+    }
+    void Status() const {
+        std::printf("\n  anti-cheat: %s | round %d\n", srv_.ac ? "ON" : "OFF", srv_.round);
+        std::printf("  SERVER truth : HP %d, stamina %.0f, potions %d, pos (%.1f,%.1f), enemy HP %d\n",
+                    srv_.health, srv_.stamina, srv_.potions, srv_.pos.x, srv_.pos.y, srv_.enemyHealth);
+        std::printf("  CLIENT HUD   : HP %d, stamina %d%s\n", cli_.Health(), cli_.Stamina(),
+                    cli_.Tampered() ? "  (integrity check FAILS)" : "");
+        std::printf("  strike points %d/%d, flagged: %s, bot-flagged: %s, swings %d, landed %d\n",
+                    srv_.strikes, Rules::strikeKick, srv_.flagged ? "yes" : "no",
+                    srv_.BotFlagged() ? "yes" : "no", srv_.swings, srv_.landed);
+        if (!srv_.counts.empty()) {
+            std::printf("  violations:");
+            for (std::map<std::string, int>::const_iterator it = srv_.counts.begin(); it != srv_.counts.end(); ++it)
+                std::printf(" %s x%d", it->first.c_str(), it->second);
+            std::puts("");
+        }
+    }
+};
+int main() {
+    Game g;
+    g.Help();
+    std::string line;
+    bool gotInput = false;
+    std::printf("> "); std::fflush(stdout);
+    while (std::getline(std::cin, line)) {
+        gotInput = true;
+        if (!g.Run(line)) return 0;
+        std::printf("> "); std::fflush(stdout);
+    }
+    if (!gotInput) {
+        std::puts("\n(no input available - running the automatic demo)");
+        g.Demo();
+    }
+    return 0;
+}
