@@ -1,0 +1,394 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <limits>
+#include <map>
+#include <string>
+#include <vector>
+
+struct Vec3 {
+    float x, y, z;
+    Vec3() : x(0), y(0), z(0) {}
+    Vec3(float a, float b, float c) : x(a), y(b), z(c) {}
+};
+
+static float Dist3(const Vec3& a, const Vec3& b) {
+    const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+static float Dist2(const Vec3& a, const Vec3& b) {
+    const float dx = b.x - a.x, dy = b.y - a.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+static std::string Fmt(const char* f, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, f);
+    std::vsnprintf(buf, sizeof buf, f, ap);
+    va_end(ap);
+    return buf;
+}
+
+namespace T {
+const float gravity = 9.8f, speedTol = 1.10f, vertTol = 0.12f, groundEps = 0.06f, world = 100.0f;
+const float teleportDist = 15.0f;
+const double minDt = 0.01, maxDt = 0.5, driftTol = 0.25;
+const int warn = 4, kick = 8, decayEvery = 12;
+}
+
+struct Specs {
+    float walk, sprint, swim, maxFall, jump, cost, regen;
+    Specs() : walk(6.0f), sprint(12.0f), swim(4.0f), maxFall(25.0f), jump(6.0f), cost(20.0f), regen(10.0f) {}
+};
+
+static float Ground(float x, float y) {
+    float h = 0.75f * (1.0f + std::sin(x * 0.15f) * std::cos(y * 0.12f));
+    const float dx = x - 40.0f, dy = y - 40.0f;
+    const float r = std::sqrt(dx * dx + dy * dy);
+    if (r < 12.0f) h -= 5.0f * (1.0f - r / 12.0f);
+    return h;
+}
+static float FloorZ(float x, float y) { return std::max(0.0f, Ground(x, y)); }
+static bool Deep(float x, float y) { return Ground(x, y) < -0.3f; }
+
+struct Packet {
+    uint32_t seq;
+    double time;
+    Vec3 pos;
+    Packet() : seq(0), time(0) {}
+};
+
+struct Verdict {
+    bool ok, dropped, flagged, kicked;
+    int weight;
+    std::string rule, detail;
+    Vec3 rollback;
+    Verdict() : ok(true), dropped(false), flagged(false), kicked(false), weight(0) {}
+};
+
+class Validator {
+public:
+    Specs sp;
+    Vec3 pos;
+    float vz, stamina, maxSpeed, maxAlt;
+    double lastClient, clientElapsed, firstServer;
+    uint32_t lastSeq;
+    int strikes, clean, packets, accepted, rejected, dropped;
+    bool flagged, kicked;
+    std::map<std::string, int> counts;
+
+    Validator(Vec3 spawn, double clientT0, double serverT0)
+        : pos(spawn), vz(sp.jump), stamina(100.0f), maxSpeed(0), maxAlt(0), lastClient(clientT0),
+          clientElapsed(0), firstServer(serverT0), lastSeq(0), strikes(0), clean(0), packets(0),
+          accepted(0), rejected(0), dropped(0), flagged(false), kicked(false) {}
+
+    Verdict Validate(const Packet& p, double now) {
+        ++packets;
+        Verdict v;
+        if (kicked) {
+            ++dropped;
+            v.ok = false;
+            v.dropped = true;
+            return v;
+        }
+        if (p.seq <= lastSeq) return Fail(v, "Sequence", Fmt("seq %u <= %u", p.seq, lastSeq), 1);
+        const double raw = p.time - lastClient;
+        if (raw <= 0.0) return Fail(v, "Timestamp", Fmt("dt %.4fs", raw), 1);
+        if (raw < T::minDt) return Fail(v, "PacketRate", Fmt("dt %.4fs below %.2fs", raw, T::minDt), 1);
+        const float dt = static_cast<float>(std::min(raw, T::maxDt));
+
+        if (!std::isfinite(p.pos.x) || !std::isfinite(p.pos.y) || !std::isfinite(p.pos.z))
+            return Reject(v, p, raw, dt, "InvalidData", "non-finite coordinates", 3);
+
+        const double drift = clientElapsed + raw - (now - firstServer);
+        if (drift > T::driftTol)
+            return Reject(v, p, raw, dt, "TimeHack", Fmt("client clock %.2fs ahead of server", drift), 2);
+
+        if (p.pos.x < 0 || p.pos.y < 0 || p.pos.x > T::world || p.pos.y > T::world)
+            return Reject(v, p, raw, dt, "OutOfBounds", Fmt("(%.1f, %.1f) outside world", p.pos.x, p.pos.y), 2);
+
+        const float d3 = Dist3(pos, p.pos);
+        if (d3 > T::teleportDist)
+            return Reject(v, p, raw, dt, "Teleport", Fmt("%.1fm in one packet (cap %.1fm)", d3, T::teleportDist), 2);
+
+        const bool deep = Deep(p.pos.x, p.pos.y);
+        const float speed = Dist2(pos, p.pos) / dt;
+        const float limit = deep ? sp.swim : (stamina > 0.0f ? sp.sprint : sp.walk);
+        if (speed > limit * T::speedTol)
+            return Reject(v, p, raw, dt, "Speed", Fmt("asserted %.1f m/s, allowed %.1f m/s", speed, limit), 1);
+
+        const float fz = FloorZ(p.pos.x, p.pos.y);
+        if (p.pos.z < fz - T::vertTol)
+            return Reject(v, p, raw, dt, "Underground", Fmt("z=%.2f below floor %.2f", p.pos.z, fz), 2);
+
+        const bool landed = p.pos.z <= fz + T::groundEps;
+        const float dz = p.pos.z - pos.z;
+        if (!landed) {
+            const float maxRise = vz * dt - 0.5f * T::gravity * dt * dt + T::vertTol;
+            if (dz > maxRise)
+                return Reject(v, p, raw, dt, "Gravity", Fmt("rose %.2fm, ballistic max %.2fm", dz, maxRise), 2);
+        }
+        if (-dz / dt > sp.maxFall * T::speedTol)
+            return Reject(v, p, raw, dt, "FallSpeed", Fmt("fell at %.1f m/s", -dz / dt), 2);
+
+        if (speed > sp.walk * T::speedTol)
+            stamina -= sp.cost * dt;
+        else
+            stamina += sp.regen * dt;
+        stamina = std::min(100.0f, std::max(0.0f, stamina));
+
+        vz = landed ? sp.jump : vz - T::gravity * dt;
+        pos = p.pos;
+        lastClient = p.time;
+        clientElapsed += raw;
+        lastSeq = p.seq;
+        ++accepted;
+        maxSpeed = std::max(maxSpeed, speed);
+        maxAlt = std::max(maxAlt, p.pos.z - fz);
+        if (++clean >= T::decayEvery && strikes > 0) {
+            --strikes;
+            clean = 0;
+        }
+        return v;
+    }
+
+private:
+    Verdict Fail(Verdict& v, const std::string& rule, const std::string& detail, int weight) {
+        ++rejected;
+        ++counts[rule];
+        strikes += weight;
+        clean = 0;
+        v.ok = false;
+        v.rule = rule;
+        v.detail = detail;
+        v.weight = weight;
+        v.rollback = pos;
+        if (strikes >= T::warn && !flagged) flagged = v.flagged = true;
+        if (strikes >= T::kick && !kicked) kicked = v.kicked = true;
+        return v;
+    }
+
+    Verdict Reject(Verdict& v, const Packet& p, double raw, float dt, const std::string& rule,
+                   const std::string& detail, int weight) {
+        Correct(dt);
+        lastClient = p.time;
+        clientElapsed += raw;
+        lastSeq = p.seq;
+        return Fail(v, rule, detail, weight);
+    }
+
+    void Correct(float dt) {
+        const float fz = FloorZ(pos.x, pos.y);
+        if (pos.z > fz + T::groundEps) {
+            const float fv = std::min(vz, 0.0f);
+            pos.z = std::max(fz, pos.z + fv * dt - 0.5f * T::gravity * dt * dt);
+            vz = fv - T::gravity * dt;
+        }
+        if (pos.z <= fz + T::groundEps) vz = sp.jump;
+    }
+};
+
+struct Session {
+    std::string name;
+    bool expectClean;
+    Validator v;
+    Vec3 pos;
+    float vz, stamina;
+    bool air;
+    double ct, t0, lastArrival, holdUntil, rate, latency, jitter;
+    uint32_t seq, rng;
+    Packet lastSent;
+    std::map<std::string, int> printed;
+
+    Session(const std::string& n, bool clean, Vec3 spawn, uint32_t seed)
+        : name(n), expectClean(clean), v(spawn, 0.0, 1000.05), pos(spawn), vz(0), stamina(100.0f), air(false),
+          ct(0), t0(1000.0), lastArrival(1000.05), holdUntil(0), rate(1.0), latency(0.05), jitter(0.03),
+          seq(0), rng(seed) {
+        std::printf("\n== %s ==\n", name.c_str());
+    }
+
+    double Rand() {
+        rng = rng * 1664525u + 1013904223u;
+        return (rng >> 8) / 16777216.0;
+    }
+    double Frame() { return 0.1 + (Rand() - 0.5) * 0.04; }
+
+    void Deliver(const Packet& p, double arrival) {
+        lastSent = p;
+        const Verdict r = v.Validate(p, arrival);
+        if (r.dropped || r.ok) return;
+        pos = v.pos;
+        air = pos.z > FloorZ(pos.x, pos.y) + T::groundEps;
+        vz = 0;
+        if (++printed[r.rule] <= 2)
+            std::printf("  #%-3u %-12s %s (+%d -> %d/%d)\n", p.seq, r.rule.c_str(), r.detail.c_str(), r.weight,
+                        v.strikes, T::kick);
+        if (r.flagged) std::printf("  >> flagged for review\n");
+        if (r.kicked) std::printf("  >> kicked\n");
+    }
+
+    void Send(Vec3 claimed, double dt) {
+        ct += dt;
+        Packet p;
+        p.seq = ++seq;
+        p.time = ct;
+        p.pos = claimed;
+        pos = claimed;
+        double nat = t0 + ct / rate + latency + (Rand() - 0.5) * 2.0 * jitter;
+        if (nat < holdUntil) nat = holdUntil;
+        const double arrival = std::max(nat, lastArrival + 0.002);
+        lastArrival = arrival;
+        Deliver(p, arrival);
+    }
+
+    void Replay() { Deliver(lastSent, lastArrival + 0.01); }
+
+    void Walk(float dx, float dy, bool sprint, bool jump) {
+        const double dt = Frame();
+        const float fdt = static_cast<float>(dt);
+        const float len = std::sqrt(dx * dx + dy * dy);
+        const float ux = len > 1e-6f ? dx / len : 0.0f, uy = len > 1e-6f ? dy / len : 0.0f;
+        bool run = sprint && stamina > 12.0f && !air;
+        float speed = run ? 11.4f : 5.5f;
+        float nx = std::min(T::world, std::max(0.0f, pos.x + ux * speed * fdt));
+        float ny = std::min(T::world, std::max(0.0f, pos.y + uy * speed * fdt));
+        if (Deep(nx, ny)) {
+            run = false;
+            speed = 3.8f;
+            nx = std::min(T::world, std::max(0.0f, pos.x + ux * speed * fdt));
+            ny = std::min(T::world, std::max(0.0f, pos.y + uy * speed * fdt));
+        }
+        float nz, nvz = vz;
+        bool nair = air;
+        if (!air && jump && !Deep(pos.x, pos.y)) {
+            nvz = v.sp.jump;
+            nair = true;
+        }
+        if (nair) {
+            nz = pos.z + nvz * fdt - 0.5f * T::gravity * fdt * fdt;
+            nvz -= T::gravity * fdt;
+            if (nz <= FloorZ(nx, ny)) {
+                nz = FloorZ(nx, ny);
+                nair = false;
+                nvz = 0;
+            }
+        } else {
+            nz = FloorZ(nx, ny);
+        }
+        stamina += run ? -v.sp.cost * fdt : v.sp.regen * fdt;
+        stamina = std::min(100.0f, std::max(0.0f, stamina));
+        vz = nvz;
+        air = nair;
+        Send(Vec3(nx, ny, nz), dt);
+    }
+
+    void Fast(float dx, float dy, float speed) {
+        const double dt = Frame();
+        const float len = std::sqrt(dx * dx + dy * dy);
+        const float nx = std::min(T::world, std::max(0.0f, pos.x + dx / len * speed * static_cast<float>(dt)));
+        const float ny = std::min(T::world, std::max(0.0f, pos.y + dy / len * speed * static_cast<float>(dt)));
+        Send(Vec3(nx, ny, FloorZ(nx, ny)), dt);
+    }
+
+    void Climb(float rise) { Send(Vec3(pos.x, pos.y, pos.z + rise), Frame()); }
+};
+
+static Vec3 Spawn() { return Vec3(10.0f, 10.0f, FloorZ(10.0f, 10.0f)); }
+
+static void HonestRoute(Session& s) {
+    for (int i = 0; i < 25; ++i) s.Walk(1, 0.4f, i % 10 < 5, i % 7 == 3);
+    int guard = 0;
+    while (!Deep(s.pos.x, s.pos.y) && guard++ < 500) s.Walk(40 - s.pos.x, 40 - s.pos.y, true, guard % 25 == 0);
+    for (int i = 0; i < 30; ++i) s.Walk(1, 0.2f, true, false);
+    for (int i = 0; i < 40; ++i) s.Walk(1, -0.5f, true, false);
+}
+
+int main() {
+    std::vector<Session*> all;
+
+    Session* a = new Session("honest_jitter", true, Spawn(), 11u);
+    HonestRoute(*a);
+    all.push_back(a);
+
+    Session* b = new Session("honest_lagspike", true, Spawn(), 12u);
+    for (int i = 0; i < 30; ++i) b->Walk(1, 0.3f, i % 9 < 4, false);
+    b->holdUntil = b->lastArrival + 1.2;
+    for (int i = 0; i < 12; ++i) b->Walk(1, 0.3f, false, false);
+    for (int i = 0; i < 30; ++i) b->Walk(1, 0.3f, i % 9 < 4, i % 11 == 5);
+    all.push_back(b);
+
+    Session* c = new Session("speedhacker", false, Spawn(), 13u);
+    for (int i = 0; i < 20; ++i) c->Walk(1, 0.3f, false, false);
+    for (int i = 0; i < 15; ++i) c->Fast(1, 0.3f, 24.0f);
+    all.push_back(c);
+
+    Session* d = new Session("flyhacker", false, Spawn(), 14u);
+    for (int i = 0; i < 10; ++i) d->Walk(1, 0.3f, false, false);
+    for (int i = 0; i < 10; ++i) d->Climb(0.65f);
+    all.push_back(d);
+
+    Session* e = new Session("hoverhacker", false, Spawn(), 15u);
+    for (int i = 0; i < 10; ++i) e->Walk(1, 0.3f, false, false);
+    e->Walk(1, 0.3f, false, true);
+    for (int i = 0; i < 3; ++i) e->Walk(1, 0.3f, false, false);
+    for (int i = 0; i < 12; ++i) e->Climb(0.0f);
+    all.push_back(e);
+
+    Session* f = new Session("clockhacker", false, Spawn(), 16u);
+    f->rate = 1.6;
+    for (int i = 0; i < 40; ++i) f->Walk(1, 0.3f, false, false);
+    all.push_back(f);
+
+    Session* g = new Session("water_speed", false, Spawn(), 17u);
+    int guard = 0;
+    while (!Deep(g->pos.x, g->pos.y) && guard++ < 500) g->Walk(40 - g->pos.x, 40 - g->pos.y, true, false);
+    for (int i = 0; i < 15; ++i) g->Fast(1, 0.2f, 12.0f);
+    all.push_back(g);
+
+    Session* h = new Session("mixed_cheater", false, Spawn(), 18u);
+    for (int i = 0; i < 10; ++i) h->Walk(1, 0.3f, false, false);
+    h->Send(h->pos, 0.002);
+    h->Send(h->pos, 0.002);
+    h->Walk(1, 0.3f, false, false);
+    h->Replay();
+    h->Walk(1, 0.3f, false, false);
+    h->Send(Vec3(std::numeric_limits<float>::quiet_NaN(), 0, 0), h->Frame());
+    h->Walk(1, 0.3f, false, false);
+    h->Send(Vec3(h->pos.x + 60.0f, h->pos.y, 0), h->Frame());
+    for (int i = 0; i < 10; ++i) h->Walk(1, 0.3f, false, false);
+    all.push_back(h);
+
+    Session* k = new Session("noclip_cheater", false, Spawn(), 19u);
+    for (int i = 0; i < 10; ++i) k->Walk(1, 0.3f, false, false);
+    k->Send(Vec3(k->pos.x, k->pos.y, FloorZ(k->pos.x, k->pos.y) - 3.0f), k->Frame());
+    k->Walk(1, 0.3f, false, false);
+    k->Send(Vec3(-5.0f, k->pos.y, 0), k->Frame());
+    k->Walk(1, 0.3f, false, false);
+    k->Send(Vec3(k->pos.x, k->pos.y, FloorZ(k->pos.x, k->pos.y) - 4.0f), k->Frame());
+    for (int i = 0; i < 10; ++i) k->Walk(1, 0.3f, false, false);
+    all.push_back(k);
+
+    std::printf("\n%-16s %5s %5s %4s %5s %7s %-8s %7s %6s  %s\n", "player", "pkts", "ok", "rej", "drop",
+                "strikes", "status", "maxSpd", "maxAlt", "result");
+    int passed = 0;
+    for (size_t i = 0; i < all.size(); ++i) {
+        const Session& s = *all[i];
+        const Validator& v = s.v;
+        const char* status = v.kicked ? "KICKED" : (v.flagged ? "FLAGGED" : "CLEAN");
+        const bool pass = s.expectClean ? (!v.flagged && !v.kicked) : (v.flagged || v.kicked);
+        passed += pass ? 1 : 0;
+        std::printf("%-16s %5d %5d %4d %5d %7d %-8s %7.1f %6.2f  %s\n", s.name.c_str(), v.packets, v.accepted,
+                    v.rejected, v.dropped, v.strikes, status, v.maxSpeed, v.maxAlt, pass ? "PASS" : "FAIL");
+        if (!v.counts.empty()) {
+            std::printf("%-16s", "");
+            for (std::map<std::string, int>::const_iterator it = v.counts.begin(); it != v.counts.end(); ++it)
+                std::printf(" %s:%d", it->first.c_str(), it->second);
+            std::printf("\n");
+        }
+    }
+    std::printf("\n%d/%d passed\n", passed, static_cast<int>(all.size()));
+    for (size_t i = 0; i < all.size(); ++i) delete all[i];
+    return 0;
+}
